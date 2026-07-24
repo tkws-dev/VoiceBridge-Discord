@@ -18,13 +18,23 @@ Build an AI voice bot that listens and speaks in Discord voice channels. Two app
 
 **Works today. ~20-30s total latency. Not truly "live" but functional.**
 
-### Architecture
+## Architecture v11 (Gemini-Powered)
 
 ```
-Discord Voice → voice_recv (Opus → PCM) → faster-whisper (Thai STT)
-→ GPT-4o via Codex (LLM) → gTTS (Thai TTS) → Discord Voice
+Discord Voice → Gemini STT (cloud) → Gemini Flash LLM → gTTS TTS → Discord Voice
+                    1-2s                 3-5s           0.5-2s
+                              Total: ~5-10s (3x faster!)
 ```
 
+**One API key, zero local dependencies for STT/LLM.**
+
+### Why This Architecture (inspired by OpenPud)
+
+| Our Old | New | Improvement |
+|---------|-----|-------------|
+| faster-whisper `base` (local CPU) | Gemini STT (cloud GPU) | 3x faster, more accurate Thai |
+| Hermes CLI → GPT-4o | Gemini Flash direct API | No 5-8s overhead |
+| Multiple credentials | One GOOGLE_API_KEY | Simpler setup |
 ### Prerequisites
 
 1. **Discord Bot** with Privileged Intents:

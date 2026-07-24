@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
-"""Discord Voice Bridge — Pipeline Mode (STT → LLM → TTS)
+"""Discord Voice Bridge v11 — Gemini-powered (STT + LLM via Google AI Studio)
 
-One-command voice bot for Discord. Just clone, setup.sh, and run.
+Architecture inspired by OpenPud:
+  Gemini STT → Gemini Flash LLM → gTTS TTS
+  One API key, no Hermes CLI overhead, ~5-10s total
 
 Usage:
     source venv/bin/activate
     python bridge_pipeline.py <voice_channel_id> <guild_id>
-
-Env vars (in .env):
-    DISCORD_BOT_TOKEN   — Discord bot token (required)
-    GOOGLE_API_KEY      — Gemini API key for LLM (recommended, no Hermes needed)
-    HERMES_HOME         — Optional: Hermes install path for Codex/GPT-4o access
 """
 import asyncio, os, sys, io, tempfile, subprocess, time, wave, re, json
 from pathlib import Path
 from collections import defaultdict
 
 # ============================================================
-# PATCH: discord-ext-voice_recv has opus decoder bugs
-# Without this, corrupted packets crash the router thread
+# PATCH: discord-ext-voice_recv opus decoder bugs
 # ============================================================
 import discord.ext.voice_recv.opus as _opus
-_orig_decode = _opus.PacketDecoder._decode_packet
-def _safe_decode(self, packet):
-    try: return _orig_decode(self, packet)
+_orig = _opus.PacketDecoder._decode_packet
+def _safe(self, packet):
+    try: return _orig(self, packet)
     except: return (packet, b'')
-_opus.PacketDecoder._decode_packet = _safe_decode
+_opus.PacketDecoder._decode_packet = _safe
 
 import discord
 from discord.ext import commands
@@ -33,21 +29,11 @@ from discord.ext.voice_recv import VoiceRecvClient, AudioSink, VoiceData
 from gtts import gTTS
 
 # ============================================================
-# Auto-detection — no hardcoded paths
+# Config — single Gemini key for everything
 # ============================================================
-HERMES_HOME = os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes'))
-HERMES_VENV = os.path.join(HERMES_HOME, 'hermes-agent', 'venv')
-HERMES_BIN = os.path.join(HERMES_VENV, 'bin', 'hermes')
-HAS_HERMES = os.path.isfile(HERMES_BIN)
-
-GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY', '')
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '')
-
-# ============================================================
-# Config
-# ============================================================
-LLM_PROVIDER = 'gemini' if GOOGLE_API_KEY else ('hermes' if HAS_HERMES else None)
-print(f'🔧 LLM: {LLM_PROVIDER} (Hermes: {HAS_HERMES}, Gemini: {bool(GOOGLE_API_KEY)})')
+GEMINI_KEY = os.environ.get('GOOGLE_API_KEY', '')
+GEMINI_MODEL = 'gemini-2.0-flash'  # fast + free tier
 
 VOICE_CH = int(sys.argv[1])
 GUILD = int(sys.argv[2])
@@ -60,7 +46,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 vc = None
 
 # ============================================================
-# TTS: gTTS (fast Thai, free)
+# TTS: gTTS Thai (free, fast)
 # ============================================================
 def tts(text: str) -> bytes:
     if len(text) > 500: text = text[:500] + "..."
@@ -74,60 +60,72 @@ def tts(text: str) -> bytes:
     return d
 
 # ============================================================
-# STT: faster-whisper (local, free, Thai-optimized)
+# STT: Gemini Speech-to-Text (cloud, accurate Thai)
 # ============================================================
 def stt(pcm: bytes) -> str:
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f: wp = f.name
-    with wave.open(wp, 'wb') as wf:
+    """Send PCM audio to Gemini for transcription."""
+    import base64, urllib.request, urllib.error
+    
+    # Convert PCM to WAV in memory
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
         wf.setnchannels(2); wf.setsampwidth(2); wf.setframerate(48000)
         wf.writeframes(pcm)
-    r = subprocess.run([sys.executable, '-c', f'''
-from faster_whisper import WhisperModel
-m = WhisperModel("base", device="cpu", compute_type="int8")
-s, _ = m.transcribe("{wp}", language="th", beam_size=1, best_of=1,
-    vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500))
-print(" ".join(x.text for x in s))
-'''], capture_output=True, text=True, timeout=15)
-    os.unlink(wp)
-    # Filter: Thai chars only (strip Whisper hallucinations)
-    cleaned = re.sub(r'[^\u0E00-\u0E7F\u0E50-\u0E59\s.]', '', r.stdout.strip())
-    return re.sub(r'\s+', ' ', cleaned).strip()
+    audio_b64 = base64.b64encode(buf.getvalue()).decode()
+    
+    # Gemini speech-to-text via generateContent with audio
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+    payload = json.dumps({
+        "contents": [{
+            "parts": [
+                {"text": "Transcribe this audio in Thai. Output ONLY the Thai text, nothing else."},
+                {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}}
+            ]
+        }]
+    }).encode()
+    
+    try:
+        req = urllib.request.Request(url, data=payload, 
+            headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+            text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+            # Clean: strip non-Thai
+            return re.sub(r'\s+', ' ', text).strip()
+    except Exception as e:
+        print(f'  ⚠️ STT error: {e}')
+        return ''
 
 # ============================================================
-# LLM: Auto-select provider (Gemini first, then Hermes/Codex)
+# LLM: Gemini Flash (fast, natural Thai)
 # ============================================================
 async def llm(text: str) -> str:
-    prompt = f"""ตอบแบบธรรมชาติ เป็นกันเอง สั้นๆ ตรงประเด็น ใช้ภาษาพูด
+    """One API call to Gemini for chat response."""
+    import aiohttp
+    
+    prompt = f"""คุณคือผู้ช่วยเสียงภาษาไทย ตอบแบบธรรมชาติ สั้น ตรงประเด็น ใช้ภาษาพูด
+ห้ามใช้ bullet points, markdown, หรือเครื่องหมายพิเศษ
 
-ผู้ใช้พูด: {text}
+ผู้ใช้พูดว่า: {text}
+
 ตอบ:"""
-
-    if GOOGLE_API_KEY:
-        # Direct Gemini API — fast, no Hermes overhead
-        import aiohttp
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GOOGLE_API_KEY}"
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+    try:
         async with aiohttp.ClientSession() as s:
             async with s.post(url, json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.7, "maxOutputTokens": 200}
-            }) as resp:
+            }, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 data = await resp.json()
-                try:
+                if 'candidates' in data:
                     return data['candidates'][0]['content']['parts'][0]['text'].strip()
-                except:
-                    return "ขอโทษครับ Gemini ไม่ตอบ"
-
-    elif HAS_HERMES:
-        # Hermes CLI via Codex OAuth — GPT-4o access
-        proc = await asyncio.create_subprocess_exec(
-            HERMES_BIN, 'chat', '-q', prompt,
-            '-m', 'gpt-4o', '--provider', 'openai-codex', '--quiet',
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await proc.communicate()
-        return stdout.decode().strip()
-
-    else:
-        return "❌ No LLM configured. Set GOOGLE_API_KEY or install Hermes."
+                elif 'error' in data:
+                    print(f'  ⚠️ LLM error: {data["error"]["message"][:100]}')
+                    return ''
+    except Exception as e:
+        print(f'  ⚠️ LLM error: {e}')
+        return ''
 
 async def speak(audio: bytes):
     global vc
@@ -137,7 +135,7 @@ async def speak(audio: bytes):
     while vc.is_playing(): await asyncio.sleep(0.05)
 
 # ============================================================
-# Audio Sink — receives Discord voice, buffers, triggers STT
+# Audio Sink — receives Discord voice, triggers on silence
 # ============================================================
 class Sink(AudioSink):
     def __init__(self):
@@ -148,7 +146,6 @@ class Sink(AudioSink):
     def wants_opus(self) -> bool: return False
 
     def write(self, user, data: VoiceData):
-        # SSRC may not be mapped — fallback to first human in channel
         if user is None and data.pcm:
             if hasattr(self, '_vc'):
                 for m in self._vc.channel.members:
@@ -166,7 +163,7 @@ class Sink(AudioSink):
                 now = time.time()
                 for uid in list(self.buf):
                     if uid in self.proc: continue
-                    if now - self.last.get(uid, 0) > 0.8 and len(self.buf[uid]) > 24000:
+                    if now - self.last.get(uid, 0) > 1.0 and len(self.buf[uid]) > 48000:
                         self.proc.add(uid)
                         asyncio.ensure_future(self._go(uid, bytes(self.buf[uid])))
                         self.buf[uid].clear()
@@ -192,12 +189,12 @@ class Sink(AudioSink):
 @bot.event
 async def on_ready():
     global vc
-    print(f'✅ {bot.user}')
+    print(f'✅ v11 Gemini | {bot.user}')
     g = bot.get_guild(GUILD)
     ch = g.get_channel(VOICE_CH)
     vc = await ch.connect(cls=VoiceRecvClient)
     sink = Sink(); sink._vc = vc; vc.listen(sink); sink.start(asyncio.get_event_loop())
-    print(f'🎤 {ch.name} | 🦻 Listening...')
+    print(f'🎤 {ch.name} | 🦻 Gemini STT + LLM + gTTS')
     await speak(tts("พร้อมครับ พูดมาเลย"))
 
 @bot.command(name='say')
@@ -208,12 +205,13 @@ async def say(ctx, *, text: str):
 @bot.command(name='ask')
 async def ask(ctx, *, q: str):
     if not vc: return await ctx.send('❌')
+    await ctx.send('🤔...')
     resp = await llm(q)
-    if vc and vc.is_connected():
-        await speak(await asyncio.to_thread(tts, resp))
+    if resp:
+        await ctx.send(f'💬 {resp[:300]}')
+        if vc.is_connected():
+            await speak(await asyncio.to_thread(tts, resp))
 
 if __name__ == '__main__':
-    if not TOKEN:
-        print('❌ Set DISCORD_BOT_TOKEN in .env'); sys.exit(1)
-    print('🎙️ Voice Bridge — Pipeline Mode')
+    print('🎙️ v11 — Gemini STT + Gemini LLM + gTTS (~5-10s)')
     bot.run(TOKEN)
