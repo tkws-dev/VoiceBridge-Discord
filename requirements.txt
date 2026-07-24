@@ -1,0 +1,7 @@
+discord.py[voice]>=2.0
+gTTS
+faster-whisper
+discord-ext-voice_recv
+pydub
+google-genai
+websockets
