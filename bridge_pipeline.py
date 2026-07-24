@@ -1,11 +1,25 @@
-# Discord Voice Bridge — Pipeline Approach
-# STT (faster-whisper) → LLM (GPT-4o via Codex) → TTS (gTTS)
-# NOTE: ~20-30s latency. For true live voice, use bridge_gemini_live.py
+#!/usr/bin/env python3
+"""Discord Voice Bridge — Pipeline Mode (STT → LLM → TTS)
 
-import asyncio, os, sys, io, tempfile, subprocess, time, wave, re
+One-command voice bot for Discord. Just clone, setup.sh, and run.
+
+Usage:
+    source venv/bin/activate
+    python bridge_pipeline.py <voice_channel_id> <guild_id>
+
+Env vars (in .env):
+    DISCORD_BOT_TOKEN   — Discord bot token (required)
+    GOOGLE_API_KEY      — Gemini API key for LLM (recommended, no Hermes needed)
+    HERMES_HOME         — Optional: Hermes install path for Codex/GPT-4o access
+"""
+import asyncio, os, sys, io, tempfile, subprocess, time, wave, re, json
+from pathlib import Path
 from collections import defaultdict
 
-# --- PATCH: workaround for discord-ext-voice_recv opus decode bugs ---
+# ============================================================
+# PATCH: discord-ext-voice_recv has opus decoder bugs
+# Without this, corrupted packets crash the router thread
+# ============================================================
 import discord.ext.voice_recv.opus as _opus
 _orig_decode = _opus.PacketDecoder._decode_packet
 def _safe_decode(self, packet):
@@ -18,13 +32,26 @@ from discord.ext import commands
 from discord.ext.voice_recv import VoiceRecvClient, AudioSink, VoiceData
 from gtts import gTTS
 
-# --- Config ---
-TOKEN = os.environ['DISCORD_BOT_TOKEN']
+# ============================================================
+# Auto-detection — no hardcoded paths
+# ============================================================
+HERMES_HOME = os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes'))
+HERMES_VENV = os.path.join(HERMES_HOME, 'hermes-agent', 'venv')
+HERMES_BIN = os.path.join(HERMES_VENV, 'bin', 'hermes')
+HAS_HERMES = os.path.isfile(HERMES_BIN)
+
+GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY', '')
+TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '')
+
+# ============================================================
+# Config
+# ============================================================
+LLM_PROVIDER = 'gemini' if GOOGLE_API_KEY else ('hermes' if HAS_HERMES else None)
+print(f'🔧 LLM: {LLM_PROVIDER} (Hermes: {HAS_HERMES}, Gemini: {bool(GOOGLE_API_KEY)})')
+
 VOICE_CH = int(sys.argv[1])
 GUILD = int(sys.argv[2])
-VENV = os.path.expanduser('~/.hermes/hermes-agent/venv')
 
-# --- Discord Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -32,7 +59,9 @@ intents.guilds = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 vc = None
 
-# --- TTS: gTTS → WAV (Thai, fast) ---
+# ============================================================
+# TTS: gTTS (fast Thai, free)
+# ============================================================
 def tts(text: str) -> bytes:
     if len(text) > 500: text = text[:500] + "..."
     with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f: mp = f.name
@@ -44,7 +73,9 @@ def tts(text: str) -> bytes:
     os.unlink(mp); os.unlink(wp)
     return d
 
-# --- STT: faster-whisper base model (Thai) ---
+# ============================================================
+# STT: faster-whisper (local, free, Thai-optimized)
+# ============================================================
 def stt(pcm: bytes) -> str:
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f: wp = f.name
     with wave.open(wp, 'wb') as wf:
@@ -58,22 +89,45 @@ s, _ = m.transcribe("{wp}", language="th", beam_size=1, best_of=1,
 print(" ".join(x.text for x in s))
 '''], capture_output=True, text=True, timeout=15)
     os.unlink(wp)
-    # Filter: keep only Thai chars + basic punctuation
+    # Filter: Thai chars only (strip Whisper hallucinations)
     cleaned = re.sub(r'[^\u0E00-\u0E7F\u0E50-\u0E59\s.]', '', r.stdout.strip())
     return re.sub(r'\s+', ' ', cleaned).strip()
 
-# --- LLM: GPT-4o via Hermes Codex (for best Thai quality) ---
+# ============================================================
+# LLM: Auto-select provider (Gemini first, then Hermes/Codex)
+# ============================================================
 async def llm(text: str) -> str:
     prompt = f"""ตอบแบบธรรมชาติ เป็นกันเอง สั้นๆ ตรงประเด็น ใช้ภาษาพูด
 
 ผู้ใช้พูด: {text}
 ตอบ:"""
-    proc = await asyncio.create_subprocess_exec(
-        f'{VENV}/bin/hermes', 'chat', '-q', prompt,
-        '-m', 'gpt-4o', '--provider', 'openai-codex', '--quiet',
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    stdout, _ = await proc.communicate()
-    return stdout.decode().strip()
+
+    if GOOGLE_API_KEY:
+        # Direct Gemini API — fast, no Hermes overhead
+        import aiohttp
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GOOGLE_API_KEY}"
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 200}
+            }) as resp:
+                data = await resp.json()
+                try:
+                    return data['candidates'][0]['content']['parts'][0]['text'].strip()
+                except:
+                    return "ขอโทษครับ Gemini ไม่ตอบ"
+
+    elif HAS_HERMES:
+        # Hermes CLI via Codex OAuth — GPT-4o access
+        proc = await asyncio.create_subprocess_exec(
+            HERMES_BIN, 'chat', '-q', prompt,
+            '-m', 'gpt-4o', '--provider', 'openai-codex', '--quiet',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await proc.communicate()
+        return stdout.decode().strip()
+
+    else:
+        return "❌ No LLM configured. Set GOOGLE_API_KEY or install Hermes."
 
 async def speak(audio: bytes):
     global vc
@@ -82,7 +136,9 @@ async def speak(audio: bytes):
     vc.play(discord.PCMVolumeTransformer(s, volume=1.0))
     while vc.is_playing(): await asyncio.sleep(0.05)
 
-# --- Audio Sink: buffers voice, triggers on silence ---
+# ============================================================
+# Audio Sink — receives Discord voice, buffers, triggers STT
+# ============================================================
 class Sink(AudioSink):
     def __init__(self):
         super().__init__()
@@ -92,7 +148,7 @@ class Sink(AudioSink):
     def wants_opus(self) -> bool: return False
 
     def write(self, user, data: VoiceData):
-        # Fallback: assign unknown SSRC to first human in channel
+        # SSRC may not be mapped — fallback to first human in channel
         if user is None and data.pcm:
             if hasattr(self, '_vc'):
                 for m in self._vc.channel.members:
@@ -110,7 +166,6 @@ class Sink(AudioSink):
                 now = time.time()
                 for uid in list(self.buf):
                     if uid in self.proc: continue
-                    # 0.8s silence + 0.25s buffer = fast trigger
                     if now - self.last.get(uid, 0) > 0.8 and len(self.buf[uid]) > 24000:
                         self.proc.add(uid)
                         asyncio.ensure_future(self._go(uid, bytes(self.buf[uid])))
@@ -131,7 +186,9 @@ class Sink(AudioSink):
         except Exception as e: print(f'❌ {e}')
         finally: self.proc.discard(uid)
 
-# --- Bot Events ---
+# ============================================================
+# Bot
+# ============================================================
 @bot.event
 async def on_ready():
     global vc
@@ -156,5 +213,7 @@ async def ask(ctx, *, q: str):
         await speak(await asyncio.to_thread(tts, resp))
 
 if __name__ == '__main__':
+    if not TOKEN:
+        print('❌ Set DISCORD_BOT_TOKEN in .env'); sys.exit(1)
     print('🎙️ Voice Bridge — Pipeline Mode')
     bot.run(TOKEN)
